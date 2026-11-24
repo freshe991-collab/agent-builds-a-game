@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Star Catcher — built from one prompt</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #14101f; height: 100%; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1080" height="1920"></canvas>
+<script>
+// Star Catcher — a tiny browser game built from one prompt:
+// "Build me a tiny browser game: catch the falling stars."
+// Move the basket, catch stars, don't drop them. 30 seconds, 3 lives.
+// ?autoplay=1 makes the basket play itself (used for the demo video).
+(function () {
+  'use strict';
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var W = 1080, H = 1920;
+
+  // Seeded RNG so every run plays the same way.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(1337);
+  var params = new URLSearchParams(location.search);
+  var AUTOPLAY = params.get('autoplay') === '1';
+
+  // Background stars (static decoration).
+  var bgStars = [];
+  for (var i = 0; i < 90; i++) {
+    bgStars.push({ x: rng() * W, y: rng() * H, r: 1 + rng() * 2.5, a: 0.25 + rng() * 0.55 });
+  }
+
+  var state = {
+    score: 0, lives: 3, timeLeft: 30, over: false, overAt: 0,
+    basketX: W / 2, targetX: W / 2,
+    stars: [], parts: [], popups: [],
+    spawnIn: 0, elapsed: 0, shake: 0, flash: 0
+  };
+
+  function resetGame() {
+    state.score = 0; state.lives = 3; state.timeLeft = 30; state.over = false;
+    state.basketX = W / 2; state.targetX = W / 2;
+    state.stars = []; state.parts = []; state.popups = [];
+    state.spawnIn = 0; state.elapsed = 0; state.shake = 0; state.flash = 0;
+  }
+
+  function spawnStar() {
+    var speed = 420 + Math.min(420, state.elapsed * 14);
+    state.stars.push({
+      x: 60 + rng() * (W - 120),
+      y: 440, // below the HUD so stars never cross the title
+      r: 26 + rng() * 14,
+      vy: speed * (0.85 + rng() * 0.4),
+      rot: rng() * Math.PI * 2,
+      vr: (rng() - 0.5) * 2.4,
+      hue: rng()
+    });
+  }
+
+  function burst(x, y, color) {
+    for (var i = 0; i < 16; i++) {
+      var a = rng() * Math.PI * 2, sp = 120 + rng() * 320;
+      state.parts.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 120, life: 0.55, color: color });
+    }
+  }
+
+  function drawStar(x, y, r, rot, color) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(rot);
+    ctx.beginPath();
+    for (var i = 0; i < 10; i++) {
+      var rr = (i % 2 === 0) ? r : r * 0.45;
+      var a = (i / 10) * Math.PI * 2 - Math.PI / 2;
+      var px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fillStyle = color; ctx.fill();
+    ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.stroke();
+    ctx.restore();
+  }
+
+  function update(dt) {
+    if (state.over) {
+      // Autoplay restarts by itself so the demo footage never freezes.
+      if (AUTOPLAY && performance.now() - state.overAt > 2500) resetGame();
+      return;
+    }
+    state.elapsed += dt;
+    state.timeLeft = Math.max(0, 30 - state.elapsed);
+    if (state.timeLeft <= 0) { state.over = true; state.overAt = performance.now(); return; }
+
+    state.spawnIn -= dt;
+    if (state.spawnIn <= 0) { spawnStar(); state.spawnIn = 0.5 - Math.min(0.16, state.elapsed * 0.004); }
+
+    // Basket movement. Autoplay picks the earliest-arriving star it can still
+    // reach (the basket covers ~950 px/s), and skips ones already lost.
+    var basketY = H - 260;
+    if (AUTOPLAY) {
+      var best = null, bestScore = Infinity;
+      for (var i = 0; i < state.stars.length; i++) {
+        var st = state.stars[i];
+        var t = (basketY - st.y) / st.vy;
+        if (t < 0) continue;
+        var dist = Math.abs(st.x - state.basketX);
+        if (dist > 950 * t + 170) continue;
+        var score = t * 1000 + dist;
+        if (score < bestScore) { bestScore = score; best = st; }
+      }
+      if (best) state.targetX = best.x;
+    }
+    var dx = state.targetX - state.basketX;
+    state.basketX += dx * Math.min(1, dt * 12);
+    state.basketX = Math.max(110, Math.min(W - 110, state.basketX));
+
+    for (var s = state.stars.length - 1; s >= 0; s--) {
+      var st = state.stars[s];
+      st.y += st.vy * dt; st.rot += st.vr * dt;
+      if (st.y >= basketY - 10 && st.y <= basketY + 90 && Math.abs(st.x - state.basketX) < 170) {
+        state.score += 1;
+        state.popups.push({ x: st.x, y: st.y - 30, text: '+1', life: 0.8 });
+        burst(st.x, st.y, '#FFD34D');
+        state.stars.splice(s, 1);
+      } else if (st.y > H + 60) {
+        state.stars.splice(s, 1);
+        state.lives -= 1; state.shake = 14; state.flash = 0.25;
+        if (state.lives <= 0) { state.over = true; state.overAt = performance.now(); }
+      }
+    }
+    for (var p = state.parts.length - 1; p >= 0; p--) {
+      var pt = state.parts[p];
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.vy += 500 * dt; pt.life -= dt;
+      if (pt.life <= 0) state.parts.splice(p, 1);
+    }
+    for (var u = state.popups.length - 1; u >= 0; u--) {
+      state.popups[u].y -= 60 * dt; state.popups[u].life -= dt;
+      if (state.popups[u].life <= 0) state.popups.splice(u, 1);
+    }
+    if (state.shake > 0) state.shake = Math.max(0, state.shake - dt * 40);
+    if (state.flash > 0) state.flash = Math.max(0, state.flash - dt);
+  }
+
+  function draw() {
+    ctx.save();
+    if (state.shake > 0) ctx.translate((rng() - 0.5) * state.shake, (rng() - 0.5) * state.shake);
+
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#17102a'); g.addColorStop(0.6, '#241533'); g.addColorStop(1, '#120e1c');
+    ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H + 40);
+
+    for (var i = 0; i < bgStars.length; i++) {
+      var b = bgStars[i];
+      ctx.globalAlpha = b.a; ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Title + HUD
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '700 54px Arial, sans-serif';
+    ctx.fillText('STAR CATCHER', W / 2, 110);
+    ctx.font = '700 120px Arial, sans-serif';
+    ctx.fillStyle = '#FFD34D';
+    ctx.fillText(String(state.score), W / 2, 260);
+    ctx.font = '600 40px Arial, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText('SCORE', W / 2, 300);
+
+    // Lives (hearts), top-right on the title row
+    ctx.font = '56px Arial, sans-serif';
+    ctx.textAlign = 'right';
+    var hearts = '';
+    for (var h = 0; h < 3; h++) hearts += (h < state.lives) ? '❤️' : '🖤';
+    ctx.fillText(hearts, W - 40, 118);
+
+    // Timer bar
+    var tw = W - 160;
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.fillRect(80, 340, tw, 18);
+    ctx.fillStyle = '#FF2E7E';
+    ctx.fillRect(80, 340, tw * (state.timeLeft / 30), 18);
+    ctx.font = '600 36px Arial, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.fillText(Math.ceil(state.timeLeft) + 's', 80, 400);
+
+    // Falling stars
+    for (var s = 0; s < state.stars.length; s++) {
+      var st = state.stars[s];
+      ctx.save();
+      ctx.shadowColor = '#FFD34D'; ctx.shadowBlur = 30;
+      drawStar(st.x, st.y, st.r, st.rot, '#FFD34D');
+      ctx.restore();
+    }
+
+    // Particles
+    for (var p = 0; p < state.parts.length; p++) {
+      var pt = state.parts[p];
+      ctx.globalAlpha = Math.max(0, pt.life / 0.55);
+      ctx.fillStyle = pt.color;
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, 6, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Score popups
+    ctx.font = '700 56px Arial, sans-serif';
+    ctx.textAlign = 'center';
+    for (var u = 0; u < state.popups.length; u++) {
+      var pp = state.popups[u];
+      ctx.globalAlpha = Math.max(0, pp.life / 0.8);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(pp.text, pp.x, pp.y);
+    }
+    ctx.globalAlpha = 1;
+
+    // Basket
+    var basketY = H - 260;
+    ctx.save();
+    ctx.shadowColor = '#FF2E7E'; ctx.shadowBlur = 24;
+    ctx.fillStyle = '#FF2E7E';
+    ctx.beginPath();
+    ctx.moveTo(state.basketX - 150, basketY);
+    ctx.lineTo(state.basketX + 150, basketY);
+    ctx.lineTo(state.basketX + 110, basketY + 110);
+    ctx.quadraticCurveTo(state.basketX, basketY + 140, state.basketX - 110, basketY + 110);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.fillRect(state.basketX - 150, basketY - 8, 300, 16);
+    ctx.font = '600 34px Arial, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText(AUTOPLAY ? 'AUTO-PLAYING' : 'DRAG TO MOVE', W / 2, H - 90);
+
+    if (state.flash > 0) {
+      ctx.fillStyle = 'rgba(255,46,126,' + (state.flash * 0.5) + ')';
+      ctx.fillRect(-20, -20, W + 40, H + 40);
+    }
+
+    if (state.over) {
+      ctx.fillStyle = 'rgba(10,6,20,0.72)';
+      ctx.fillRect(-20, -20, W + 40, H + 40);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '700 96px Arial, sans-serif';
+      ctx.fillText(state.lives <= 0 ? 'OUT OF LIVES!' : "TIME'S UP!", W / 2, H / 2 - 60);
+      ctx.font = '700 150px Arial, sans-serif';
+      ctx.fillStyle = '#FFD34D';
+      ctx.fillText(String(state.score), W / 2, H / 2 + 130);
+      ctx.font = '600 48px Arial, sans-serif';
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.fillText('FINAL SCORE', W / 2, H / 2 + 200);
+      ctx.fillStyle = '#FF2E7E';
+      ctx.font = '700 52px Arial, sans-serif';
+      ctx.fillText('Built from one prompt on make.fun', W / 2, H / 2 + 320);
+    }
+    ctx.restore();
+  }
+
+  function onPointer(e) {
+    if (state.over && !AUTOPLAY) { resetGame(); return; }
+    var rect = canvas.getBoundingClientRect();
+    var x = (e.clientX - rect.left) * (W / rect.width);
+    state.targetX = x;
+  }
+  canvas.addEventListener('pointermove', onPointer);
+  canvas.addEventListener('pointerdown', onPointer);
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowLeft') state.targetX = Math.max(110, state.targetX - 90);
+    if (e.key === 'ArrowRight') state.targetX = Math.min(W - 110, state.targetX + 90);
+  });
+
+  var last = performance.now();
+  function loop(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
